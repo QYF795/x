@@ -44,7 +44,7 @@ priv struct WindowsTimeZoneInfo {
 priv enum WindowsRecord {
   Fixed(ZoneOffset)
   Annual(WindowsRule)
-  Absolute(Int32, WindowsRule)
+  Absolute(start_year~ : Int32, end_year~ : Int32, WindowsRule)
 }
 
 ///|
@@ -52,11 +52,24 @@ fn WindowsRecord::for_year(self : WindowsRecord, year : Int32) -> Recurring {
   match self {
     Fixed(offset) => Fixed(offset)
     Annual(rule) => Windows(rule)
-    Absolute(only_year, rule) =>
-      if year == only_year {
+    Absolute(start_year~, end_year~, rule) =>
+      if year == start_year && year == end_year {
         Windows(rule)
+      } else if year == start_year {
+        Windows({ ..rule, end: YearBoundary, })
+      } else if year == end_year {
+        Windows({ ..rule, start: YearBoundary, })
       } else {
-        Fixed(rule.standard)
+        // The dates are independent one-time events. Between a start and a
+        // later end, DST stays active even in years containing neither event.
+        let daylight = if start_year < end_year {
+          start_year < year && year < end_year
+        } else if start_year > end_year {
+          year < end_year || year > start_year
+        } else {
+          rule.start.time(start_year, 0) > rule.end.time(end_year, 0)
+        }
+        Fixed(if daylight { rule.daylight } else { rule.standard })
       }
   }
 }
@@ -101,12 +114,22 @@ fn WindowsSystemTime::to_transition(
   } else {
     hour * 3600 + minute * 60 + second
   }
+  // A dated December 31 end-of-day event belongs to the next calendar year.
+  // Normalize it before limiting each absolute event to its own year.
+  let (year, month, day, second) = if year != 0 &&
+    month == 12 &&
+    day == 31 &&
+    second == 86400 {
+    (year + 1, 1, 1, 0)
+  } else {
+    (year, month, day, second)
+  }
   let date = if year == 0 && month == 1 && day == 1 && second == 0 {
     WindowsDate::YearBoundary
   } else if year == 0 {
     MonthWeekDay(month~, week=day, weekday~, second~)
   } else {
-    // Express this date in the annual evaluator only for its original year.
+    // Express this date in the annual evaluator only for its normalized year.
     // WindowsRecord::Absolute prevents it from recurring in any other year.
     let fixed = date_to_fixed_days(year, month, day)
     let weekday = (((fixed + 6L) % 7L + 7L) % 7L).to_int()
@@ -147,7 +170,8 @@ fn Zone::from_windows_rules(
   for info in rules {
     let (end_year, end) = info.standard_date.to_transition()
     let (start_year, start) = info.daylight_date.to_transition()
-    guard (start is None) == (end is None) && start_year == end_year else {
+    guard (start is None) == (end is None) &&
+      (start_year == 0) == (end_year == 0) else {
       fail("Incomplete or inconsistent Windows transition dates")
     }
     // With no seasonal dates Windows ignores both seasonal biases.
@@ -183,21 +207,20 @@ fn Zone::from_windows_rules(
           if start_year == 0 {
             Annual(rule)
           } else {
-            Absolute(start_year, rule)
+            Absolute(start_year~, end_year~, rule)
           },
         )
       }
       _ => records.push(Fixed(offsets[0]))
     }
   }
-  let endpoints = [records[0], records.last().unwrap()].map(record => {
-    match record {
-      Fixed(offset) => Recurring::Fixed(offset)
-      Annual(rule) => Windows(rule)
-      Absolute(_, rule) => Fixed(rule.standard)
-    }
-  })
-  if records.length() == 1 && !(records[0] is Absolute(_, _)) {
+  // Native years are 1..65535; end-of-day normalization can reach 65536.
+  // Query outside all dated events; annual endpoint rules remain recurring.
+  let endpoints = [
+    records[0].for_year(0),
+    records.last().unwrap().for_year(65537),
+  ]
+  if records.length() == 1 && !(records[0] is Absolute(_, ..)) {
     let rule = endpoints[0]
     return {
       id,
@@ -216,16 +239,17 @@ fn Zone::from_windows_rules(
   // Absolute endpoint dates remain one-off events even outside the registry's
   // year bounds. Expand only the finite span containing those dates.
   let first = match records[0] {
-    Absolute(year, _) =>
+    Absolute(start_year~, end_year~, _) =>
       if table_first == 0 {
-        year
+        start_year.min(end_year)
       } else {
-        table_first.min(year)
+        table_first.min(start_year).min(end_year)
       }
     _ => table_first
   }
   let last = match records.last().unwrap() {
-    Absolute(year, _) => table_last.max(year)
+    Absolute(start_year~, end_year~, _) =>
+      table_last.max(start_year).max(end_year)
     _ => table_last
   }
   let before = records[0].for_year(first - 1)

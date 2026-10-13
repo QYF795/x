@@ -292,6 +292,137 @@ test "absolute transition dates are one-off events" {
 }
 
 ///|
+test "absolute Windows daylight intervals can span calendar years" {
+  // Synthetic one-time season with Eastern offsets: October 1, 2023 at
+  // 02:00 standard time until April 7 at 02:00 daylight time in a later year.
+  for end_year in [2024, 2026] {
+    let record : WindowsTimeZoneInfo = {
+      ..eastern_windows_record,
+      daylight_date: {
+        ..eastern_windows_record.daylight_date,
+        year: 2023,
+        month: 10,
+        day: 1,
+      },
+      standard_date: {
+        ..eastern_windows_record.standard_date,
+        year: end_year,
+        month: 4,
+        day: 7,
+      },
+    }
+    let enter = PlainDateTime::of(2023, 10, 1, hour=7).to_unix_second()
+    let leave = PlainDateTime::of(end_year, 4, 7, hour=6).to_unix_second()
+    for
+      (first, rules) in [
+        (None, [record]),
+        (Some(2023), [record]),
+        (Some(end_year), [record]),
+        (Some(2023), [record, record]),
+      ] {
+      let zone = Zone::from_windows_rules("One-time winter DST", first, rules)
+      for
+        (instant, expected) in [
+          (enter - 1, -18000), // Standard time before the one-time start.
+          (enter, -14400), // The gap starts at exactly 07:00 UTC.
+          (leave - 1, -14400), // DST remains active up to the end.
+          (leave, -18000), // The overlap starts at exactly 06:00 UTC.
+          (leave + 366L * 86400, -18000), // The season does not repeat.
+        ] {
+        assert_eq(zone.lookup_offset(instant).seconds(), expected)
+      }
+      for year in 2024..<=end_year {
+        let new_year = PlainDateTime::of(year, 1, 1, hour=4).to_unix_second()
+        for delta in [-1L, 0L, 1L] {
+          assert_eq(zone.lookup_offset(new_year + delta).seconds(), -14400)
+        }
+      }
+      let gap = ZonedDateTime::of(2023, 10, 1, hour=2, minute=30, zone~)
+      assert_eq(gap.hour(), 3)
+      let wall = PlainDateTime::of(end_year, 4, 7, hour=1, minute=30)
+      let earlier = ZonedDateTime::from_plain(
+        wall,
+        zone~,
+        disambiguation=Earlier,
+      )
+      let later = ZonedDateTime::from_plain(wall, zone~, disambiguation=Later)
+      assert_eq(later.to_unix_second() - earlier.to_unix_second(), 3600L)
+    }
+  }
+}
+
+///|
+test "absolute Windows end-of-day dates can cross the year boundary" {
+  // Windows encodes next midnight as December 31 at 23:59:59.999.
+  let midnight : WindowsSystemTime = {
+    ..windows_no_date,
+    year: 2023,
+    month: 12,
+    day: 31,
+    hour: 23,
+    minute: 59,
+    second: 59,
+    millisecond: 999,
+  }
+  let record : WindowsTimeZoneInfo = {
+    ..eastern_windows_record,
+    daylight_date: midnight,
+    standard_date: { ..midnight, year: 2024, },
+  }
+  let zone = Zone::from_windows_rules("One-time year of DST", None, [record])
+  let enter = PlainDateTime::of(2024, 1, 1, hour=5).to_unix_second()
+  let leave = PlainDateTime::of(2025, 1, 1, hour=4).to_unix_second()
+  for
+    (instant, expected) in [
+      (enter - 1, -18000),
+      (enter, -14400),
+      (leave - 1, -14400),
+      (leave, -18000),
+      (leave + 366L * 86400, -18000),
+    ] {
+    assert_eq(zone.lookup_offset(instant).seconds(), expected)
+  }
+}
+
+///|
+test "absolute Windows dates retain chronological order when standard comes first" {
+  // The one-time end comes before the one-time start: daylight time before
+  // April 2023 and after October 2024, standard time between the two events.
+  let record : WindowsTimeZoneInfo = {
+    ..eastern_windows_record,
+    standard_date: {
+      ..eastern_windows_record.standard_date,
+      year: 2023,
+      month: 4,
+      day: 7,
+    },
+    daylight_date: {
+      ..eastern_windows_record.daylight_date,
+      year: 2024,
+      month: 10,
+      day: 1,
+    },
+  }
+  let zone = Zone::from_windows_rules("One-time standard interval", None, [
+    record,
+  ])
+  let leave = PlainDateTime::of(2023, 4, 7, hour=6).to_unix_second()
+  let enter = PlainDateTime::of(2024, 10, 1, hour=7).to_unix_second()
+  for
+    (instant, expected) in [
+      (leave - 366L * 86400, -14400), // Before the first absolute event.
+      (leave - 1, -14400),
+      (leave, -18000),
+      (PlainDateTime::of(2024, 1, 1).to_unix_second(), -18000),
+      (enter - 1, -18000),
+      (enter, -14400),
+      (enter + 366L * 86400, -14400), // After the last absolute event.
+    ] {
+    assert_eq(zone.lookup_offset(instant).seconds(), expected)
+  }
+}
+
+///|
 test "identical Windows transition dates disable daylight saving" {
   // Synthetic disabled-DST input: equal nonzero dates, with distinct biases.
   // Cover a recurring date, an absolute date, and the January boundary marker.

@@ -52,6 +52,9 @@
 
 ### Fixed
 
+- `@time.local_zone()` on Windows accepts one-time seasonal transitions in
+  different years and preserves the active offset across intervening New Years. (#340)
+
 - `@time.ZonedDateTime` hour, minute, second, and nanosecond additions now
   advance by the requested elapsed time across time-zone offset changes.
   Calendar-day additions continue to follow local dates. (#331)
